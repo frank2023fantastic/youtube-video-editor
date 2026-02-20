@@ -17,7 +17,7 @@ const LANGUAGES = [
 ]
 
 const PIPELINE_STEPS = [
-  { key: 'downloading', label: 'Download', icon: '⬇️' },
+  { key: 'ingesting', label: 'Ingest', icon: '📥' },
   { key: 'separating', label: 'Separate', icon: '🎵' },
   { key: 'transcribing', label: 'Transcribe', icon: '📝' },
   { key: 'translating', label: 'Translate', icon: '🌍' },
@@ -26,24 +26,51 @@ const PIPELINE_STEPS = [
 ]
 
 function App() {
-  const [url, setUrl] = useState('')
+  const [file, setFile] = useState(null)
   const [language, setLanguage] = useState('spanish')
   const [jobId, setJobId] = useState(null)
-  const [status, setStatus] = useState(null) // { status, progress, step, message, error }
+  const [status, setStatus] = useState(null)
   const [isProcessing, setIsProcessing] = useState(false)
+  const [isDragging, setIsDragging] = useState(false)
+  const fileInputRef = useRef(null)
   const eventSourceRef = useRef(null)
 
+  const handleFileSelect = (selectedFile) => {
+    if (selectedFile && selectedFile.type.startsWith('video/')) {
+      setFile(selectedFile)
+    }
+  }
+
+  const handleDrop = (e) => {
+    e.preventDefault()
+    setIsDragging(false)
+    const droppedFile = e.dataTransfer.files[0]
+    handleFileSelect(droppedFile)
+  }
+
+  const handleDragOver = (e) => {
+    e.preventDefault()
+    setIsDragging(true)
+  }
+
+  const handleDragLeave = () => {
+    setIsDragging(false)
+  }
+
   const startProcessing = useCallback(async () => {
-    if (!url.trim()) return
+    if (!file) return
 
     setIsProcessing(true)
     setStatus(null)
 
     try {
+      const formData = new FormData()
+      formData.append('file', file)
+      formData.append('target_language', language)
+
       const res = await fetch('/api/process', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url.trim(), target_language: language }),
+        body: formData,
       })
 
       if (!res.ok) {
@@ -83,13 +110,7 @@ function App() {
 
           if (update.status === 'completed' || update.status === 'failed') {
             evtSource.close()
-            setIsProcessing(update.status !== 'completed' && update.status !== 'failed')
-            if (update.status === 'completed') {
-              setIsProcessing(false)
-            }
-            if (update.status === 'failed') {
-              setIsProcessing(false)
-            }
+            setIsProcessing(false)
           }
         } catch (e) {
           console.error('SSE parse error:', e)
@@ -104,7 +125,7 @@ function App() {
       setStatus({ status: 'failed', message: `Network error: ${err.message}`, progress: 0 })
       setIsProcessing(false)
     }
-  }, [url, language])
+  }, [file, language])
 
   const getStepStatus = (stepKey) => {
     if (!status) return 'pending'
@@ -118,6 +139,11 @@ function App() {
     if (stepIndex < currentIndex) return 'completed'
     if (stepIndex === currentIndex) return 'active'
     return 'pending'
+  }
+
+  const formatFileSize = (bytes) => {
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
   }
 
   return (
@@ -146,19 +172,47 @@ function App() {
         {/* Main card */}
         <div className="glass-card p-8 fade-in" style={{ animationDelay: '0.1s' }}>
           <div className="space-y-6">
-            {/* URL Input */}
+            {/* File Upload Area */}
             <div>
               <label className="block text-sm font-medium text-[var(--color-text-secondary)] mb-2">
-                YouTube URL
+                Upload Video
               </label>
-              <input
-                type="url"
-                className="input-field"
-                placeholder="https://youtube.com/watch?v=..."
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-                disabled={isProcessing}
-              />
+              <div
+                className={`upload-zone ${isDragging ? 'dragging' : ''} ${file ? 'has-file' : ''}`}
+                onDrop={handleDrop}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onClick={() => !isProcessing && fileInputRef.current?.click()}
+              >
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="video/*"
+                  className="hidden"
+                  onChange={(e) => handleFileSelect(e.target.files[0])}
+                  disabled={isProcessing}
+                />
+                {file ? (
+                  <div className="text-center">
+                    <span className="text-3xl block mb-2">🎥</span>
+                    <p className="text-[var(--color-text-primary)] font-medium">{file.name}</p>
+                    <p className="text-[var(--color-text-secondary)] text-sm mt-1">{formatFileSize(file.size)}</p>
+                    {!isProcessing && (
+                      <p className="text-[var(--color-accent-secondary)] text-xs mt-2 opacity-70">Click to change file</p>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-center">
+                    <span className="text-4xl block mb-3">📁</span>
+                    <p className="text-[var(--color-text-secondary)]">
+                      Drag & drop your video here
+                    </p>
+                    <p className="text-[var(--color-text-secondary)] text-sm mt-1 opacity-60">
+                      or click to browse — MP4, MKV, WebM, AVI, MOV
+                    </p>
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* Language select */}
@@ -182,7 +236,7 @@ function App() {
             <button
               className="btn-primary w-full text-lg"
               onClick={startProcessing}
-              disabled={isProcessing || !url.trim()}
+              disabled={isProcessing || !file}
             >
               {isProcessing ? (
                 <span className="flex items-center justify-center gap-2">

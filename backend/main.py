@@ -1,28 +1,28 @@
 """
-YouTube Multi-Language Dubbing Web App — FastAPI Backend
+Multi-Language Video Dubbing Web App — FastAPI Backend
 
 Endpoints:
-  POST /api/process       — start a dubbing job
+  POST /api/process       — upload an MP4 + target language to start dubbing
   GET  /api/status/{id}   — SSE stream of job progress
   GET  /api/download/{id} — download the finished file
 """
 
 import asyncio
 import uuid
+import shutil
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
 
 from pipeline import jobs, run_pipeline
-from utils import validate_youtube_url, check_ffmpeg, cleanup_job
+from utils import get_job_dir, check_ffmpeg, cleanup_job
 
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="YouTube Multi-Language Dubbing", version="1.0.0")
+app = FastAPI(title="Multi-Language Video Dubbing", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,14 +31,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# ---------------------------------------------------------------------------
-# Request model
-# ---------------------------------------------------------------------------
-class ProcessRequest(BaseModel):
-    url: str
-    target_language: str
 
 
 # ---------------------------------------------------------------------------
@@ -53,11 +45,17 @@ async def health():
 
 
 @app.post("/api/process")
-async def start_process(req: ProcessRequest):
-    """Start a new dubbing job."""
-    # Validate
-    if not validate_youtube_url(req.url):
-        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+async def start_process(
+    file: UploadFile = File(...),
+    target_language: str = Form(...),
+):
+    """Start a new dubbing job with an uploaded video file."""
+    # Validate file type
+    if not file.filename or not file.filename.lower().endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov')):
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload a video file (.mp4, .mkv, .webm, .avi, .mov)"
+        )
 
     if not check_ffmpeg():
         raise HTTPException(status_code=500, detail="FFmpeg is not installed or not found on PATH")
@@ -68,13 +66,25 @@ async def start_process(req: ProcessRequest):
         "status": "queued",
         "progress": 0,
         "step": "queued",
-        "message": "Job queued...",
+        "message": "Job queued, saving uploaded file...",
         "error": None,
         "output_file": None,
     }
 
+    # Save uploaded file to job directory
+    job_dir = get_job_dir(job_id)
+    video_path = job_dir / "source.mp4"
+
+    try:
+        with open(video_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
+    finally:
+        await file.close()
+
     # Launch pipeline in background
-    asyncio.create_task(run_pipeline(job_id, req.url.strip(), req.target_language.lower()))
+    asyncio.create_task(run_pipeline(job_id, str(video_path), target_language.lower()))
 
     return {"job_id": job_id}
 

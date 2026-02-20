@@ -1,15 +1,13 @@
 """
-YouTube Multi-Language Dubbing Pipeline
+Multi-Language Video Dubbing Pipeline
 
-Orchestrates: Download -> Separate -> Transcribe -> Translate -> TTS -> Mix
+Orchestrates: Ingest -> Separate -> Transcribe -> Translate -> TTS -> Mix
 """
 
 import sys
 import asyncio
 import os
-import glob
 import subprocess
-import time
 import traceback
 from pathlib import Path
 
@@ -35,89 +33,35 @@ def update_job(job_id: str, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Step 1 – Download (multi-strategy: yt-dlp → Publer fallback)
+# Step 1 – Ingest uploaded video (extract audio via FFmpeg)
 # ---------------------------------------------------------------------------
-SCRAPER_SCRIPT = Path(__file__).parent / "_download_scraper.py"
+async def ingest_video(job_id: str, video_path: str) -> dict:
+    """Process the user-uploaded video and extract audio.
 
-
-async def download_video(job_id: str, url: str) -> dict:
-    """Download video from YouTube using multi-strategy subprocess scraper.
-
-    Runs _download_scraper.py as a separate process which tries:
-      1. yt-dlp  (5 format strategies, most reliable)
-      2. Publer.com via Playwright+stealth (fallback)
-
-    A debug screenshot is saved to job_dir/debug_timeout.png if Publer times out.
+    The uploaded file should already be saved at `video_path` inside the
+    job directory by the API layer.
     """
-    import json
-
-    update_job(job_id, step="downloading", progress=5, message="Starting download...")
+    update_job(job_id, step="ingesting", progress=5, message="Processing uploaded video...")
 
     job_dir = get_job_dir(job_id)
-    video_file = job_dir / "source.mp4"
+    video_file = Path(video_path)
     audio_file = job_dir / "source_audio.wav"
 
-    update_job(job_id, progress=10, message="Downloading video (trying multiple strategies)...")
-
-    # Run the scraper as a completely separate Python process
-    try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            [
-                sys.executable, str(SCRAPER_SCRIPT),
-                url, str(video_file), str(job_dir),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=300,  # 5 min total timeout for all strategies
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            "Download timed out after 5 minutes (all strategies exhausted)"
-        )
-    except Exception as e:
-        raise RuntimeError(f"Failed to launch scraper: {e}")
-
-    # Parse the JSON output from the scraper
-    stdout = result.stdout.strip()
-    stderr = result.stderr.strip()
-
-    if result.returncode != 0:
-        # Try to get error from JSON output
-        try:
-            data = json.loads(stdout)
-            error_msg = data.get("error", "Unknown error")
-            debug_ss = data.get("debug_screenshot")
-            if debug_ss:
-                error_msg += f" (debug screenshot: {debug_ss})"
-        except (json.JSONDecodeError, ValueError):
-            error_msg = stderr or stdout or "Scraper exited with no output"
-        raise RuntimeError(f"Download failed: {error_msg}")
-
-    # Parse success output
-    try:
-        data = json.loads(stdout)
-        strategy = data.get("strategy", "unknown")
-        update_job(job_id, progress=20,
-                   message=f"Video downloaded via {strategy}, extracting audio...")
-    except (json.JSONDecodeError, ValueError):
-        update_job(job_id, progress=20, message="Video downloaded, extracting audio...")
-
-    # Verify the file exists
     if not video_file.exists() or video_file.stat().st_size < 1024:
-        raise RuntimeError("Downloaded video file is empty or missing")
+        raise RuntimeError("Uploaded video file is empty or missing")
 
-    # ── Extract audio track ──────────────────────────────────────────────
-    update_job(job_id, progress=25, message="Extracting audio track...")
+    update_job(job_id, progress=10, message="Extracting audio track...")
+
+    # Extract audio track
     ffmpeg.input(str(video_file)).output(
         str(audio_file), ac=1, ar=16000, format="wav"
     ).overwrite_output().run(quiet=True)
 
-    update_job(job_id, progress=30, message="Download complete")
+    if not audio_file.exists():
+        raise RuntimeError("Failed to extract audio from video")
+
+    update_job(job_id, progress=15, message="Video ingested, audio extracted")
     return {"video": str(video_file), "audio": str(audio_file)}
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +194,6 @@ async def synthesize_tts(job_id: str, segments: list[dict], target_lang: str) ->
         raise RuntimeError("No TTS segments generated")
 
     # Build a full-length TTS track aligned to original timestamps
-    # Load each clip and place it at the correct timestamp
     max_end = max(seg["end"] for seg in segments)
     full_track = AudioSegment.silent(duration=int(max_end * 1000) + 5000)
 
@@ -258,7 +201,6 @@ async def synthesize_tts(job_id: str, segments: list[dict], target_lang: str) ->
         try:
             clip = AudioSegment.from_file(tts["file"])
             position_ms = int(tts["start"] * 1000)
-            # Truncate clip if it's longer than original segment duration
             seg_duration_ms = int((tts["end"] - tts["start"]) * 1000)
             if len(clip) > seg_duration_ms * 1.5:
                 clip = clip.speedup(playback_speed=len(clip) / max(seg_duration_ms, 1))
@@ -284,13 +226,11 @@ def mix_audio_video(job_id: str, video_path: str, bg_path: str, tts_path: str) -
     output_path = str(job_dir / "dubbed_output.mp4")
 
     try:
-        # Mix background stem + TTS dubbing track
         mixed_audio_path = str(job_dir / "mixed_audio.wav")
 
         bg_input = ffmpeg.input(bg_path)
         tts_input = ffmpeg.input(tts_path)
 
-        # Use amix to combine background (lower volume) + TTS (full volume)
         mixed = ffmpeg.filter(
             [bg_input.audio, tts_input.audio],
             "amix",
@@ -300,7 +240,6 @@ def mix_audio_video(job_id: str, video_path: str, bg_path: str, tts_path: str) -
         )
         ffmpeg.output(mixed, mixed_audio_path).overwrite_output().run(quiet=True)
 
-        # Merge mixed audio with original video
         video_input = ffmpeg.input(video_path)
         audio_input = ffmpeg.input(mixed_audio_path)
 
@@ -323,7 +262,7 @@ def mix_audio_video(job_id: str, video_path: str, bg_path: str, tts_path: str) -
 # ---------------------------------------------------------------------------
 # Full Pipeline Orchestrator
 # ---------------------------------------------------------------------------
-async def run_pipeline(job_id: str, url: str, target_language: str):
+async def run_pipeline(job_id: str, video_path: str, target_language: str):
     """Execute the full dubbing pipeline end-to-end."""
     try:
         update_job(
@@ -336,8 +275,8 @@ async def run_pipeline(job_id: str, url: str, target_language: str):
             output_file=None,
         )
 
-        # 1. Download
-        paths = await download_video(job_id, url)
+        # 1. Ingest uploaded video
+        paths = await ingest_video(job_id, video_path)
 
         # 2. Separate audio
         stems = separate_audio(job_id, paths["audio"])

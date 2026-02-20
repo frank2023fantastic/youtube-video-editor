@@ -1,6 +1,5 @@
-"""Utility functions for the YouTube dubbing pipeline."""
+"""Utility functions for the video dubbing pipeline."""
 
-import re
 import os
 import shutil
 import tempfile
@@ -10,19 +9,6 @@ from pathlib import Path
 JOBS_DIR = Path(tempfile.gettempdir()) / "yt_dubbing_jobs"
 JOBS_DIR.mkdir(exist_ok=True)
 
-
-def validate_youtube_url(url: str) -> bool:
-    """Validate that the given URL is a valid YouTube URL."""
-    youtube_patterns = [
-        r'(https?://)?(www\.)?youtube\.com/watch\?v=[\w-]{11}',
-        r'(https?://)?(www\.)?youtube\.com/shorts/[\w-]{11}',
-        r'(https?://)?youtu\.be/[\w-]{11}',
-        r'(https?://)?(www\.)?youtube\.com/embed/[\w-]{11}',
-    ]
-    for pattern in youtube_patterns:
-        if re.match(pattern, url.strip()):
-            return True
-    return False
 
 
 def get_job_dir(job_id: str) -> Path:
