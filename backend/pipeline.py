@@ -35,38 +35,46 @@ def update_job(job_id: str, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Step 1 – Download via Publer.com (Playwright headless scraper)
+# Step 1 – Download (multi-strategy: yt-dlp → Publer fallback)
 # ---------------------------------------------------------------------------
-SCRAPER_SCRIPT = Path(__file__).parent / "_publer_scraper.py"
+SCRAPER_SCRIPT = Path(__file__).parent / "_download_scraper.py"
 
 
 async def download_video(job_id: str, url: str) -> dict:
-    """Download video from YouTube by scraping Publer.com with headless Chromium.
+    """Download video from YouTube using multi-strategy subprocess scraper.
 
-    Runs _publer_scraper.py as a separate process to avoid Windows asyncio
-    subprocess conflicts with uvicorn's event loop.
+    Runs _download_scraper.py as a separate process which tries:
+      1. yt-dlp  (5 format strategies, most reliable)
+      2. Publer.com via Playwright+stealth (fallback)
+
+    A debug screenshot is saved to job_dir/debug_timeout.png if Publer times out.
     """
     import json
 
-    update_job(job_id, step="downloading", progress=5, message="Launching Publer scraper...")
+    update_job(job_id, step="downloading", progress=5, message="Starting download...")
 
     job_dir = get_job_dir(job_id)
     video_file = job_dir / "source.mp4"
     audio_file = job_dir / "source_audio.wav"
 
-    update_job(job_id, progress=10, message="Scraping Publer.com for download link (up to 90s)...")
+    update_job(job_id, progress=10, message="Downloading video (trying multiple strategies)...")
 
     # Run the scraper as a completely separate Python process
     try:
         result = await asyncio.to_thread(
             subprocess.run,
-            [sys.executable, str(SCRAPER_SCRIPT), url, str(video_file)],
+            [
+                sys.executable, str(SCRAPER_SCRIPT),
+                url, str(video_file), str(job_dir),
+            ],
             capture_output=True,
             text=True,
-            timeout=180,  # 3 min total timeout
+            timeout=300,  # 5 min total timeout for all strategies
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError("Publer scraper timed out after 3 minutes")
+        raise RuntimeError(
+            "Download timed out after 5 minutes (all strategies exhausted)"
+        )
     except Exception as e:
         raise RuntimeError(f"Failed to launch scraper: {e}")
 
@@ -79,15 +87,25 @@ async def download_video(job_id: str, url: str) -> dict:
         try:
             data = json.loads(stdout)
             error_msg = data.get("error", "Unknown error")
+            debug_ss = data.get("debug_screenshot")
+            if debug_ss:
+                error_msg += f" (debug screenshot: {debug_ss})"
         except (json.JSONDecodeError, ValueError):
             error_msg = stderr or stdout or "Scraper exited with no output"
-        raise RuntimeError(f"Publer download failed: {error_msg}")
+        raise RuntimeError(f"Download failed: {error_msg}")
+
+    # Parse success output
+    try:
+        data = json.loads(stdout)
+        strategy = data.get("strategy", "unknown")
+        update_job(job_id, progress=20,
+                   message=f"Video downloaded via {strategy}, extracting audio...")
+    except (json.JSONDecodeError, ValueError):
+        update_job(job_id, progress=20, message="Video downloaded, extracting audio...")
 
     # Verify the file exists
     if not video_file.exists() or video_file.stat().st_size < 1024:
         raise RuntimeError("Downloaded video file is empty or missing")
-
-    update_job(job_id, progress=20, message="Video downloaded, extracting audio...")
 
     # ── Extract audio track ──────────────────────────────────────────────
     update_job(job_id, progress=25, message="Extracting audio track...")
@@ -97,6 +115,7 @@ async def download_video(job_id: str, url: str) -> dict:
 
     update_job(job_id, progress=30, message="Download complete")
     return {"video": str(video_file), "audio": str(audio_file)}
+
 
 
 
