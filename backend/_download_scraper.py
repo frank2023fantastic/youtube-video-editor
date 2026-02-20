@@ -151,7 +151,8 @@ def try_publer(url: str, output_path: str, job_dir: str | None) -> dict | None:
 
     try:
         playwright_obj = sync_playwright().start()
-        browser = playwright_obj.chromium.launch(headless=True)
+        # Launch visible browser to significantly reduce bot-detection probability
+        browser = playwright_obj.chromium.launch(headless=False)
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -168,6 +169,9 @@ def try_publer(url: str, output_path: str, job_dir: str | None) -> dict | None:
 
         # Navigate to Publer
         page.goto(PUBLER_URL, wait_until="networkidle", timeout=30000)
+
+        # Human-like delay upon page load
+        page.wait_for_timeout(3000)
 
         # Dismiss cookie consent banner
         try:
@@ -190,8 +194,11 @@ def try_publer(url: str, output_path: str, job_dir: str | None) -> dict | None:
             return {"skipped": False, "errors": ["Could not find URL input on Publer"]}
 
         input_el.click()
-        input_el.type(url, delay=30)  # Type like a human
-        page.wait_for_timeout(500)
+        # Simulate human physically typing with a 120ms delay between keystrokes
+        input_el.type(url, delay=120)  
+        
+        # Human-like delay before clicking submit
+        page.wait_for_timeout(1500)
 
         # Click the Download submit button
         submit_btn = page.query_selector('button[type="submit"]')
@@ -200,7 +207,7 @@ def try_publer(url: str, output_path: str, job_dir: str | None) -> dict | None:
         else:
             page.press('input[placeholder="https://"]', "Enter")
 
-        # Wait for download link to appear (polling approach, up to 120s)
+        # Wait for download link to appear (polling approach, up to 120s which is > 60000ms)
         download_href = None
         start_time = time.time()
         timeout_secs = 120
