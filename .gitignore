@@ -8,3 +8,7 @@ build/
 .vscode/
 .idea/
 *.log
+backend/cookies.txt
+yt_dubbing_jobs/
+backend/separated/
+backend/tts_segments/

@@ -46,61 +46,58 @@ def download_video(job_id: str, url: str) -> dict:
     output_template = str(job_dir / "source.%(ext)s")
     cookies_path = Path(__file__).parent / "cookies.txt"
 
-    # Base options shared across all attempts
+    # Base options — use simple "best" format to avoid "Requested format is not available"
     base_opts = {
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "merge_output_format": "mp4",
+        "format": "best",
         "outtmpl": output_template,
         "noplaylist": True,
         "restrictfilenames": True,
         "quiet": True,
         "no_warnings": True,
         "nocheckcertificate": True,
+        "extractor_args": {"youtube": {"player_client": ["android,web"]}},
     }
 
-    # Build a list of strategies to try in order
+    # Build strategies in priority order
     strategies = []
 
-    # Strategy 1: Impersonate Chrome + use Android player client (best combo)
+    # Strategy 1 (PRIMARY): cookies.txt + Android client
+    # This is the most reliable method on Windows where DPAPI breaks browser cookie reading
+    if cookies_path.exists() and cookies_path.stat().st_size > 0:
+        strategies.append({
+            **base_opts,
+            "cookiefile": str(cookies_path),
+            "_label": "Downloading with cookies.txt (primary)...",
+        })
+
+    # Strategy 2: Impersonate Chrome via curl_cffi + Android client
     try:
         import curl_cffi
         strategies.append({
             **base_opts,
             "impersonate": "chrome",
-            "extractor_args": {"youtube": {"player_client": ["android,web"]}},
             "_label": "Impersonating Chrome + Android client...",
         })
     except ImportError:
         pass
 
-    # Strategy 2: Use cookies.txt if provided + Android client
-    if cookies_path.exists() and cookies_path.stat().st_size > 0:
-        strategies.append({
-            **base_opts,
-            "cookiefile": str(cookies_path),
-            "extractor_args": {"youtube": {"player_client": ["android,web"]}},
-            "_label": "Using cookies.txt + Android client...",
-        })
-
-    # Strategy 3: Try reading cookies from Edge + Android client
+    # Strategy 3: Plain guest download with browser user-agent
     strategies.append({
         **base_opts,
-        "cookiesfrombrowser": ("edge",),
-        "extractor_args": {"youtube": {"player_client": ["android,web"]}},
-        "_label": "Reading cookies from Edge + Android client...",
-    })
-
-    # Strategy 4: Simple format with Android client (no merge needed)
-    strategies.append({
-        **base_opts,
-        "format": "best[ext=mp4]/best",
-        "extractor_args": {"youtube": {"player_client": ["android,web"]}},
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         },
-        "_label": "Simple format + Android client...",
+        "_label": "Guest download with Android client...",
     })
 
+    def _cleanup_temp_files():
+        """Delete .part, .ytdl, and partial source files to prevent FFmpeg muxing conflicts."""
+        for f in job_dir.iterdir():
+            if f.suffix in (".part", ".ytdl") or f.name.startswith("source"):
+                try:
+                    f.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     last_error = None
     for i, opts in enumerate(strategies):
@@ -132,13 +129,11 @@ def download_video(job_id: str, url: str) -> dict:
 
         except Exception as e:
             last_error = str(e)
-            # Clean up any partial downloads before retrying
-            for f in job_dir.iterdir():
-                if f.name.startswith("source"):
-                    f.unlink(missing_ok=True)
+            _cleanup_temp_files()
             continue
 
     raise RuntimeError(f"All download strategies failed. Last error: {last_error}")
+
 
 
 # ---------------------------------------------------------------------------
