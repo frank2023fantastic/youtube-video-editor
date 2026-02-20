@@ -34,106 +34,157 @@ def update_job(job_id: str, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Step 1 – Download
+# Step 1 – Download via Publer.com (Playwright headless scraper)
 # ---------------------------------------------------------------------------
-def download_video(job_id: str, url: str) -> dict:
-    """Download video + audio from YouTube using yt-dlp Python API."""
-    import yt_dlp
+PUBLER_URL = "https://publer.com/tools/youtube-video-downloader"
 
-    update_job(job_id, step="downloading", progress=5, message="Downloading video from YouTube...")
+
+async def download_video(job_id: str, url: str) -> dict:
+    """Download video from YouTube by scraping Publer.com with headless Chromium."""
+    from playwright.async_api import async_playwright
+    import httpx
+
+    update_job(job_id, step="downloading", progress=5, message="Launching headless browser...")
 
     job_dir = get_job_dir(job_id)
-    output_template = str(job_dir / "source.%(ext)s")
-    cookies_path = Path(__file__).parent / "cookies.txt"
+    video_file = job_dir / "source.mp4"
+    audio_file = job_dir / "source_audio.wav"
 
-    # Base options — use simple "best" format to avoid "Requested format is not available"
-    base_opts = {
-        "format": "best",
-        "outtmpl": output_template,
-        "noplaylist": True,
-        "restrictfilenames": True,
-        "quiet": True,
-        "no_warnings": True,
-        "nocheckcertificate": True,
-        "extractor_args": {"youtube": {"player_client": ["android,web"]}},
-    }
-
-    # Build strategies in priority order
-    strategies = []
-
-    # Strategy 1 (PRIMARY): cookies.txt + Android client
-    # This is the most reliable method on Windows where DPAPI breaks browser cookie reading
-    if cookies_path.exists() and cookies_path.stat().st_size > 0:
-        strategies.append({
-            **base_opts,
-            "cookiefile": str(cookies_path),
-            "_label": "Downloading with cookies.txt (primary)...",
-        })
-
-    # Strategy 2: Impersonate Chrome via curl_cffi + Android client
+    playwright = None
+    browser = None
     try:
-        import curl_cffi
-        strategies.append({
-            **base_opts,
-            "impersonate": "chrome",
-            "_label": "Impersonating Chrome + Android client...",
-        })
-    except ImportError:
-        pass
+        # ── Launch headless Chromium ──────────────────────────────────────
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/121.0.0.0 Safari/537.36"
+            )
+        )
+        page = await context.new_page()
 
-    # Strategy 3: Plain guest download with browser user-agent
-    strategies.append({
-        **base_opts,
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        },
-        "_label": "Guest download with Android client...",
-    })
+        # ── Navigate to Publer downloader ────────────────────────────────
+        update_job(job_id, progress=7, message="Navigating to Publer downloader...")
+        await page.goto(PUBLER_URL, wait_until="networkidle", timeout=30000)
 
-    def _cleanup_temp_files():
-        """Delete .part, .ytdl, and partial source files to prevent FFmpeg muxing conflicts."""
-        for f in job_dir.iterdir():
-            if f.suffix in (".part", ".ytdl") or f.name.startswith("source"):
-                try:
-                    f.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        # ── Fill the URL input ───────────────────────────────────────────
+        update_job(job_id, progress=10, message="Injecting YouTube URL...")
 
-    last_error = None
-    for i, opts in enumerate(strategies):
-        label = opts.pop("_label", f"Strategy {i+1}")
-        update_job(job_id, message=label)
-
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([url])
-
-            # Check if the file was actually downloaded
-            video_file = None
-            for f in job_dir.iterdir():
-                if f.name.startswith("source") and f.suffix in (".mp4", ".mkv", ".webm"):
-                    video_file = f
+        # Try multiple selectors for the input field
+        input_sel = None
+        for sel in [
+            'input[type="url"]',
+            'input[type="text"]',
+            'input[placeholder*="Paste"]',
+            'input[placeholder*="paste"]',
+            'input[placeholder*="URL"]',
+            'input[placeholder*="url"]',
+            'input[placeholder*="link"]',
+            'input[name="url"]',
+            "input.form-control",
+            "input",
+        ]:
+            try:
+                el = await page.wait_for_selector(sel, timeout=3000)
+                if el:
+                    input_sel = sel
                     break
+            except Exception:
+                continue
 
-            if video_file:
-                # Success! Extract audio and return
-                audio_file = job_dir / "source_audio.wav"
-                ffmpeg.input(str(video_file)).output(
-                    str(audio_file), ac=1, ar=16000, format="wav"
-                ).overwrite_output().run(quiet=True)
+        if not input_sel:
+            raise RuntimeError("Could not find URL input field on Publer page")
 
-                update_job(job_id, progress=15, message="Download complete")
-                return {"video": str(video_file), "audio": str(audio_file)}
-            else:
-                last_error = "Downloaded file not found on disk"
+        await page.fill(input_sel, url)
 
-        except Exception as e:
-            last_error = str(e)
-            _cleanup_temp_files()
-            continue
+        # ── Click the submit / download button ───────────────────────────
+        update_job(job_id, progress=12, message="Triggering download on Publer...")
 
-    raise RuntimeError(f"All download strategies failed. Last error: {last_error}")
+        btn_clicked = False
+        for sel in [
+            'button[type="submit"]',
+            "button.btn-primary",
+            "button.download-btn",
+            'button:has-text("Download")',
+            'button:has-text("Get")',
+            'button:has-text("Process")',
+            "form button",
+            "button",
+        ]:
+            try:
+                btn = await page.wait_for_selector(sel, timeout=2000)
+                if btn:
+                    await btn.click()
+                    btn_clicked = True
+                    break
+            except Exception:
+                continue
 
+        if not btn_clicked:
+            # Fallback: press Enter on the input field
+            await page.press(input_sel, "Enter")
+
+        # ── Wait for download link to appear ─────────────────────────────
+        update_job(job_id, progress=15, message="Waiting for Publer to process video (up to 60s)...")
+
+        download_href = None
+        for sel in [
+            'a[href*=".mp4"]',
+            'a[href*="download"]',
+            'a[download]',
+            'a.download-btn',
+            'a:has-text("Download")',
+            'a:has-text("download")',
+        ]:
+            try:
+                link = await page.wait_for_selector(sel, timeout=60000)
+                if link:
+                    download_href = await link.get_attribute("href")
+                    if download_href:
+                        break
+            except Exception:
+                continue
+
+        if not download_href:
+            raise RuntimeError(
+                "Publer did not produce a download link within 60 seconds. "
+                "The service may be overloaded or the video may be unavailable."
+            )
+
+        # Make relative URLs absolute
+        if download_href.startswith("/"):
+            download_href = f"https://publer.com{download_href}"
+
+        # ── Stream video file to disk ────────────────────────────────────
+        update_job(job_id, progress=20, message="Downloading video file...")
+
+        async with httpx.AsyncClient(follow_redirects=True, timeout=300) as client:
+            async with client.stream("GET", download_href) as resp:
+                resp.raise_for_status()
+                with open(video_file, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=1024 * 256):
+                        f.write(chunk)
+
+        if not video_file.exists() or video_file.stat().st_size < 1024:
+            raise RuntimeError("Downloaded video file is empty or missing")
+
+    finally:
+        # ── Always close browser to prevent memory leaks ─────────────────
+        if browser:
+            await browser.close()
+        if playwright:
+            await playwright.stop()
+
+    # ── Extract audio track ──────────────────────────────────────────────
+    update_job(job_id, progress=25, message="Extracting audio track...")
+    ffmpeg.input(str(video_file)).output(
+        str(audio_file), ac=1, ar=16000, format="wav"
+    ).overwrite_output().run(quiet=True)
+
+    update_job(job_id, progress=30, message="Download complete")
+    return {"video": str(video_file), "audio": str(audio_file)}
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +404,7 @@ async def run_pipeline(job_id: str, url: str, target_language: str):
         )
 
         # 1. Download
-        paths = download_video(job_id, url)
+        paths = await download_video(job_id, url)
 
         # 2. Separate audio
         stems = separate_audio(job_id, paths["audio"])
