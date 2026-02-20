@@ -10,6 +10,7 @@ import os
 import glob
 import subprocess
 import time
+import traceback
 from pathlib import Path
 
 import edge_tts
@@ -36,146 +37,57 @@ def update_job(job_id: str, **kwargs):
 # ---------------------------------------------------------------------------
 # Step 1 – Download via Publer.com (Playwright headless scraper)
 # ---------------------------------------------------------------------------
-PUBLER_URL = "https://publer.com/tools/youtube-video-downloader"
+SCRAPER_SCRIPT = Path(__file__).parent / "_publer_scraper.py"
 
 
 async def download_video(job_id: str, url: str) -> dict:
-    """Download video from YouTube by scraping Publer.com with headless Chromium."""
-    from playwright.async_api import async_playwright
-    import httpx
+    """Download video from YouTube by scraping Publer.com with headless Chromium.
 
-    update_job(job_id, step="downloading", progress=5, message="Launching headless browser...")
+    Runs _publer_scraper.py as a separate process to avoid Windows asyncio
+    subprocess conflicts with uvicorn's event loop.
+    """
+    import json
+
+    update_job(job_id, step="downloading", progress=5, message="Launching Publer scraper...")
 
     job_dir = get_job_dir(job_id)
     video_file = job_dir / "source.mp4"
     audio_file = job_dir / "source_audio.wav"
 
-    playwright = None
-    browser = None
+    update_job(job_id, progress=10, message="Scraping Publer.com for download link (up to 90s)...")
+
+    # Run the scraper as a completely separate Python process
     try:
-        # ── Launch headless Chromium ──────────────────────────────────────
-        playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/121.0.0.0 Safari/537.36"
-            )
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, str(SCRAPER_SCRIPT), url, str(video_file)],
+            capture_output=True,
+            text=True,
+            timeout=180,  # 3 min total timeout
         )
-        page = await context.new_page()
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Publer scraper timed out after 3 minutes")
+    except Exception as e:
+        raise RuntimeError(f"Failed to launch scraper: {e}")
 
-        # ── Navigate to Publer downloader ────────────────────────────────
-        update_job(job_id, progress=7, message="Navigating to Publer downloader...")
-        await page.goto(PUBLER_URL, wait_until="networkidle", timeout=30000)
+    # Parse the JSON output from the scraper
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
 
-        # ── Fill the URL input ───────────────────────────────────────────
-        update_job(job_id, progress=10, message="Injecting YouTube URL...")
+    if result.returncode != 0:
+        # Try to get error from JSON output
+        try:
+            data = json.loads(stdout)
+            error_msg = data.get("error", "Unknown error")
+        except (json.JSONDecodeError, ValueError):
+            error_msg = stderr or stdout or "Scraper exited with no output"
+        raise RuntimeError(f"Publer download failed: {error_msg}")
 
-        # Try multiple selectors for the input field
-        input_sel = None
-        for sel in [
-            'input[type="url"]',
-            'input[type="text"]',
-            'input[placeholder*="Paste"]',
-            'input[placeholder*="paste"]',
-            'input[placeholder*="URL"]',
-            'input[placeholder*="url"]',
-            'input[placeholder*="link"]',
-            'input[name="url"]',
-            "input.form-control",
-            "input",
-        ]:
-            try:
-                el = await page.wait_for_selector(sel, timeout=3000)
-                if el:
-                    input_sel = sel
-                    break
-            except Exception:
-                continue
+    # Verify the file exists
+    if not video_file.exists() or video_file.stat().st_size < 1024:
+        raise RuntimeError("Downloaded video file is empty or missing")
 
-        if not input_sel:
-            raise RuntimeError("Could not find URL input field on Publer page")
-
-        await page.fill(input_sel, url)
-
-        # ── Click the submit / download button ───────────────────────────
-        update_job(job_id, progress=12, message="Triggering download on Publer...")
-
-        btn_clicked = False
-        for sel in [
-            'button[type="submit"]',
-            "button.btn-primary",
-            "button.download-btn",
-            'button:has-text("Download")',
-            'button:has-text("Get")',
-            'button:has-text("Process")',
-            "form button",
-            "button",
-        ]:
-            try:
-                btn = await page.wait_for_selector(sel, timeout=2000)
-                if btn:
-                    await btn.click()
-                    btn_clicked = True
-                    break
-            except Exception:
-                continue
-
-        if not btn_clicked:
-            # Fallback: press Enter on the input field
-            await page.press(input_sel, "Enter")
-
-        # ── Wait for download link to appear ─────────────────────────────
-        update_job(job_id, progress=15, message="Waiting for Publer to process video (up to 60s)...")
-
-        download_href = None
-        for sel in [
-            'a[href*=".mp4"]',
-            'a[href*="download"]',
-            'a[download]',
-            'a.download-btn',
-            'a:has-text("Download")',
-            'a:has-text("download")',
-        ]:
-            try:
-                link = await page.wait_for_selector(sel, timeout=60000)
-                if link:
-                    download_href = await link.get_attribute("href")
-                    if download_href:
-                        break
-            except Exception:
-                continue
-
-        if not download_href:
-            raise RuntimeError(
-                "Publer did not produce a download link within 60 seconds. "
-                "The service may be overloaded or the video may be unavailable."
-            )
-
-        # Make relative URLs absolute
-        if download_href.startswith("/"):
-            download_href = f"https://publer.com{download_href}"
-
-        # ── Stream video file to disk ────────────────────────────────────
-        update_job(job_id, progress=20, message="Downloading video file...")
-
-        async with httpx.AsyncClient(follow_redirects=True, timeout=300) as client:
-            async with client.stream("GET", download_href) as resp:
-                resp.raise_for_status()
-                with open(video_file, "wb") as f:
-                    async for chunk in resp.aiter_bytes(chunk_size=1024 * 256):
-                        f.write(chunk)
-
-        if not video_file.exists() or video_file.stat().st_size < 1024:
-            raise RuntimeError("Downloaded video file is empty or missing")
-
-    finally:
-        # ── Always close browser to prevent memory leaks ─────────────────
-        if browser:
-            await browser.close()
-        if playwright:
-            await playwright.stop()
+    update_job(job_id, progress=20, message="Video downloaded, extracting audio...")
 
     # ── Extract audio track ──────────────────────────────────────────────
     update_job(job_id, progress=25, message="Extracting audio track...")
@@ -185,6 +97,8 @@ async def download_video(job_id: str, url: str) -> dict:
 
     update_job(job_id, progress=30, message="Download complete")
     return {"video": str(video_file), "audio": str(audio_file)}
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -430,9 +344,12 @@ async def run_pipeline(job_id: str, url: str, target_language: str):
         )
 
     except Exception as e:
+        tb = traceback.format_exc()
+        error_msg = str(e) if str(e) else repr(e)
+        print(f"[PIPELINE ERROR] {tb}", flush=True)
         update_job(
             job_id,
             status="failed",
-            message=f"Error: {str(e)}",
-            error=str(e),
+            message=f"Error: {error_msg}",
+            error=error_msg,
         )
